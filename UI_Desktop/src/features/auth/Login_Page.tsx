@@ -136,6 +136,7 @@ export default function Login_Page() {
               </label>
               <button
                 type="button"
+                onClick={() => navigate('/forgot-password')}
                 className="text-sm text-primary hover:text-primary-dark transition-colors"
               >
                 Quên mật khẩu?

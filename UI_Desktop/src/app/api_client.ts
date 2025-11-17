@@ -201,3 +201,16 @@ export async function apiLogout(): Promise<void> {
   });
   if (!res.ok) throw new Error("Đăng xuất thất bại");
 }
+
+export async function apiForgotPassword(email: string): Promise<void> {
+  const res = await fetch(`${BASE_URL}/auth/forgot-password`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email }),
+  });
+  
+  if (!res.ok) {
+    const error = await res.json().catch(() => ({}));
+    throw new Error(error.detail || error.message || "Gửi yêu cầu thất bại");
+  }
+}

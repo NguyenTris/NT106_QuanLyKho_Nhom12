@@ -8,6 +8,7 @@ import Layout from '../components/Layout';
 // Auth pages (UI giữ nguyên của bạn)
 import Login_Page from '../features/auth/Login_Page';
 import Register_Page from '../features/auth/Register_Page';
+import ForgotPassword_Page from '../features/auth/ForgotPassword_Page'; // Import trang mới
 
 // Main pages
 import Dashboard_Page from '../features/dashboard/Dashboard_Page';
@@ -26,6 +27,7 @@ export default function AppRoutes() {
       {/* Auth */}
       <Route path="/login" element={<Login_Page />} />
       <Route path="/register" element={<Register_Page />} />
+      <Route path="/forgot-password" element={<ForgotPassword_Page />} />
 
       {/* Default: chuyển / -> /dashboard */}
       <Route path="/" element={<Navigate to="/dashboard" replace />} />
