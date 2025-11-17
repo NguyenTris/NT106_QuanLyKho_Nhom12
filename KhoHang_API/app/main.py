@@ -161,6 +161,33 @@ def create_supplier(supplier: schemas.SupplierCreate):
     suppliers_store[new_supplier.id] = new_supplier
     return new_supplier
 
+@app.post("/auth/forgot-password", status_code=200)
+def forgot_password(payload: schemas.AuthForgotPasswordRequest):
+    """
+    Gửi email đặt lại mật khẩu qua Firebase Auth
+    """
+    url = f"https://identitytoolkit.googleapis.com/v1/accounts:sendOobCode?key={FIREBASE_API_KEY}"
+    data = {
+        "requestType": "PASSWORD_RESET",
+        "email": payload.email,
+    }
+
+    r = requests.post(url, json=data)
+    if not r.ok:
+        err = r.json()
+        msg = err.get("error", {}).get("message", "FIREBASE_ERROR")
+        # Một số lỗi phổ biến: EMAIL_NOT_FOUND
+        if msg == "EMAIL_NOT_FOUND":
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Email không tồn tại trong hệ thống",
+            )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=msg,
+        )
+    
+    return {"message": "Email đặt lại mật khẩu đã được gửi. Vui lòng kiểm tra hộp thư."}
 
 # -------------------------------------------------
 # ITEMS

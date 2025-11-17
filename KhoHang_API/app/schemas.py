@@ -104,6 +104,9 @@ class AuthResponse(BaseModel):
     token: str
     refresh_token: str | None = None
 
+class AuthForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
 # ---------- AI CHAT ----------
 
 class AIChatRequest(BaseModel):
