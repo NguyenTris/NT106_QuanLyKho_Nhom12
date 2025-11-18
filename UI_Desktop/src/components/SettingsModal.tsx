@@ -1,9 +1,10 @@
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { FaTimes, FaMoon, FaSun, FaBell, FaLanguage, FaDownload, FaInfoCircle, FaKey, FaDatabase, FaTrash, FaSync, FaShieldAlt, FaUser, FaSignOutAlt } from 'react-icons/fa';
+import { FaTimes, FaMoon, FaSun, FaBell, FaLanguage, FaDownload, FaInfoCircle, FaKey, FaDatabase, FaTrash, FaSync, FaShieldAlt, FaUser, FaSignOutAlt, FaArrowLeft, FaSave } from 'react-icons/fa';
 import { useUIStore } from '../state/ui_store';
 import { useAuthStore } from '../state/auth_store';
-import { apiLogout } from '../app/api_client';
+import { apiLogout, apiChangePassword } from '../app/api_client';
+
 
 interface SettingsModalProps {
   isOpen: boolean;
@@ -15,6 +16,12 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
   const { user, logout } = useAuthStore();
   const navigate = useNavigate();
   const [activeTab, setActiveTab] = useState<'general' | 'account' | 'notifications' | 'about'>('general');
+
+  // State cho việc đổi mật khẩu
+  const [isChangingPass, setIsChangingPass] = useState(false);
+  const [passForm, setPassForm] = useState({ oldPass: '', newPass: '', confirmPass: '' });
+  const [passStatus, setPassStatus] = useState({ loading: false, error: '', success: '' });
+
   const [language, setLanguage] = useState('vi');
   const [notifications, setNotifications] = useState({
     lowStock: true,
@@ -59,8 +66,110 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
   };
 
   const handleChangePassword = () => {
-    alert('Chức năng đổi mật khẩu đang được phát triển...');
+    setIsChangingPass(true);
   };
+
+  const handleChangePasswordSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setPassStatus({ loading: true, error: '', success: '' });
+
+    if (passForm.newPass !== passForm.confirmPass) {
+      setPassStatus({ loading: false, error: 'Mật khẩu mới không khớp', success: '' });
+      return;
+    }
+    if (passForm.newPass.length < 6) {
+      setPassStatus({ loading: false, error: 'Mật khẩu phải có ít nhất 6 ký tự', success: '' });
+      return;
+    }
+
+    try {
+      if (!user?.email) throw new Error("Không tìm thấy email người dùng");
+      
+      await apiChangePassword({
+        email: user.email,
+        oldPassword: passForm.oldPass,
+        newPassword: passForm.newPass
+      });
+
+      setPassStatus({ loading: false, error: '', success: 'Đổi mật khẩu thành công!' });
+      // Reset form sau 1s
+      setTimeout(() => {
+        setIsChangingPass(false);
+        setPassForm({ oldPass: '', newPass: '', confirmPass: '' });
+        setPassStatus({ loading: false, error: '', success: '' });
+      }, 1500);
+    } catch (err: any) {
+      setPassStatus({ loading: false, error: err.message, success: '' });
+    }
+  };
+
+  const renderChangePasswordForm = () => (
+    <div className="h-full flex flex-col">
+      <div className="flex items-center gap-2 mb-6">
+        <button 
+          onClick={() => { setIsChangingPass(false); setPassStatus({ loading: false, error: '', success: '' }); }}
+          className={`p-2 rounded-full hover:bg-zinc-100 dark:hover:bg-zinc-700 transition-colors`}
+        >
+          <FaArrowLeft />
+        </button>
+        <h3 className="font-bold text-lg">Đổi mật khẩu</h3>
+      </div>
+
+      <form onSubmit={handleChangePasswordSubmit} className="space-y-4 max-w-md">
+        {passStatus.error && (
+          <div className="p-3 bg-red-100 text-red-600 rounded-lg text-sm border border-red-200">
+            {passStatus.error}
+          </div>
+        )}
+        {passStatus.success && (
+          <div className="p-3 bg-green-100 text-green-600 rounded-lg text-sm border border-green-200">
+            {passStatus.success}
+          </div>
+        )}
+
+        <div>
+          <label className="block text-sm font-medium mb-1">Mật khẩu hiện tại</label>
+          <input
+            type="password"
+            required
+            className={`w-full p-2 rounded-lg border ${isDarkMode ? 'bg-zinc-800 border-zinc-600' : 'bg-white border-zinc-300'}`}
+            value={passForm.oldPass}
+            onChange={e => setPassForm({...passForm, oldPass: e.target.value})}
+          />
+        </div>
+
+        <div>
+          <label className="block text-sm font-medium mb-1">Mật khẩu mới</label>
+          <input
+            type="password"
+            required
+            className={`w-full p-2 rounded-lg border ${isDarkMode ? 'bg-zinc-800 border-zinc-600' : 'bg-white border-zinc-300'}`}
+            value={passForm.newPass}
+            onChange={e => setPassForm({...passForm, newPass: e.target.value})}
+          />
+        </div>
+
+        <div>
+          <label className="block text-sm font-medium mb-1">Xác nhận mật khẩu mới</label>
+          <input
+            type="password"
+            required
+            className={`w-full p-2 rounded-lg border ${isDarkMode ? 'bg-zinc-800 border-zinc-600' : 'bg-white border-zinc-300'}`}
+            value={passForm.confirmPass}
+            onChange={e => setPassForm({...passForm, confirmPass: e.target.value})}
+          />
+        </div>
+
+        <button
+          type="submit"
+          disabled={passStatus.loading}
+          className="w-full bg-primary text-white py-2 rounded-lg font-semibold hover:bg-primary-dark transition-colors disabled:opacity-50 flex items-center justify-center gap-2 mt-4"
+        >
+          {passStatus.loading ? 'Đang xử lý...' : <><FaSave /> Lưu thay đổi</>}
+        </button>
+      </form>
+    </div>
+  );
 
   return (
     <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/50 backdrop-blur-sm">
@@ -160,7 +269,7 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
 
           {/* Content Area */}
           <div className="flex-1 overflow-y-auto p-6">
-            {activeTab === 'general' && (
+            {activeTab === 'general' && (isChangingPass ? renderChangePasswordForm() : 
               <div className="space-y-6">
                 {/* Theme Toggle */}
                 <div className={`p-4 rounded-lg ${
@@ -285,7 +394,7 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
               </div>
             )}
 
-            {activeTab === 'account' && (
+            {activeTab === 'account' && (isChangingPass ? renderChangePasswordForm() :
               <div className="space-y-6">
                 {/* User Info */}
                 <div className={`p-6 rounded-lg ${
