@@ -78,6 +78,38 @@ class Warehouse(WarehouseBase):
     is_active: bool = False  # Kho đang được chọn
 
 
+# ---------- WAREHOUSE INVENTORY STATISTICS ----------
+
+class WarehouseItemStatus(BaseModel):
+    item_id: str
+    item_code: str
+    item_name: str
+    unit: str
+    total_in: int = 0  # Tổng số đã nhập
+    total_out: int = 0  # Tổng số đã xuất
+    current_stock: int = 0  # Tồn kho hiện tại
+    damaged: int = 0  # Hàng hư hỏng
+    missing: int = 0  # Hàng thiếu
+    min_stock: int = 0  # Mức tồn kho tối thiểu
+    status: str = "normal"  # normal, low_stock, out_of_stock, damaged
+
+
+class WarehouseInventoryStats(BaseModel):
+    warehouse_id: int
+    warehouse_code: str
+    warehouse_name: str
+    total_items: int  # Tổng số loại hàng hóa
+    total_quantity: int  # Tổng số lượng hàng
+    items_in_stock: int  # Số loại hàng còn tồn
+    items_low_stock: int  # Số loại hàng sắp hết
+    items_out_of_stock: int  # Số loại hàng hết
+    items_damaged: int  # Số loại hàng hư hỏng
+    items_missing: int  # Số loại hàng thiếu
+    total_damaged: int  # Tổng số lượng hàng hư hỏng
+    total_missing: int  # Tổng số lượng hàng thiếu
+    items: List[WarehouseItemStatus]  # Chi tiết từng hàng hóa
+
+
 # ---------- SUPPLIER ----------
 
 class SupplierBase(BaseModel):
@@ -95,6 +127,17 @@ class SupplierCreate(SupplierBase):
     pass
 
 
+class SupplierUpdate(BaseModel):
+    name: Optional[str] = None
+    tax_id: Optional[str] = None
+    address: Optional[str] = None
+    phone: Optional[str] = None
+    email: Optional[str] = None
+    bank_account: Optional[str] = None
+    bank_name: Optional[str] = None
+    notes: Optional[str] = None
+
+
 class Supplier(SupplierBase, ORMModel):
     id: int
     outstanding_debt: float = 0.0  # Công nợ còn lại
@@ -105,11 +148,12 @@ class Supplier(SupplierBase, ORMModel):
 class ItemBase(BaseModel):
     name: str
     sku: str
-    quantity: int
     unit: str
     price: float
     category: str
     supplier_id: Optional[int] = None
+    # Thêm trường này để biết khi nào là "Hàng thiếu"
+    min_stock: int = 10  # Định mức tồn kho tối thiểu
 
 
 class ItemCreate(ItemBase):
@@ -128,6 +172,38 @@ class ItemUpdate(BaseModel):
 
 class Item(ItemBase, ORMModel):
     id: int
+
+
+class ItemAlert(BaseModel):
+    """Schema cho cảnh báo tồn kho"""
+    id: str  # item id as string
+    name: str
+    sku: str
+    currentStock: int
+    minStock: int
+    maxStock: int
+    category: str
+    lastUpdate: str  # ISO datetime string
+    status: str  # 'critical' | 'warning' | 'low' | 'overstock'
+
+
+class TopItem(BaseModel):
+    """Schema cho top items"""
+    name: str
+    value: int  # quantity hoặc total value
+
+
+class MonthlyTrend(BaseModel):
+    """Schema cho xu hướng theo tháng"""
+    month: str  # "T1", "T2", ...
+    value: int
+
+
+class CategoryDistribution(BaseModel):
+    """Schema cho phân bố theo category"""
+    name: str
+    value: int
+    color: str
 
 
 # ---------- STOCK TRANSACTION ----------
@@ -195,6 +271,75 @@ class AIChatRequest(BaseModel):
 class AIChatResponse(BaseModel):
     reply: str
     model: str
+
+
+# ---------- CHAT MESSAGE ----------
+
+class ReplyInfo(BaseModel):
+    """Thông tin tin nhắn đang reply"""
+    id: str
+    text: str
+    sender: str
+
+
+class ChatMessageBase(BaseModel):
+    id: str
+    conversation_id: str
+    sender: str  # "user", "agent", "bot"
+    text: str
+    reply_to: ReplyInfo | None = None
+    reactions: List[str] = []  # ["👍", "❤️", ...]
+
+
+class ChatMessageCreate(ChatMessageBase):
+    pass
+
+
+class ChatMessageUpdate(BaseModel):
+    reactions: List[str] | None = None  # Cập nhật reactions
+
+
+class ChatMessage(ChatMessageBase, ORMModel):
+    created_at: datetime
+    updated_at: datetime | None = None
+
+
+# ---------- USER PREFERENCES (Theme) ----------
+
+class ChatThemeConfig(BaseModel):
+    """Config theme cho một chế độ (light hoặc dark)"""
+    gradient_id: str = "default"
+    pattern_id: str | None = None
+    pattern_opacity: float = 0.1
+    pattern_size_px: int = 300
+    pattern_tint: str | None = None
+
+
+class UserPreferencesBase(BaseModel):
+    accent_id: str = "blue"
+    
+    # Chat theme cho Light mode
+    light_mode_theme: ChatThemeConfig = ChatThemeConfig()
+    
+    # Chat theme cho Dark mode
+    dark_mode_theme: ChatThemeConfig = ChatThemeConfig()
+
+
+class UserPreferencesCreate(UserPreferencesBase):
+    pass
+
+
+class UserPreferencesUpdate(BaseModel):
+    accent_id: str | None = None
+    light_mode_theme: ChatThemeConfig | None = None
+    dark_mode_theme: ChatThemeConfig | None = None
+
+
+class UserPreferences(UserPreferencesBase, ORMModel):
+    id: int
+    user_id: str
+    created_at: datetime
+    updated_at: datetime | None = None
 
 
 # ---------- STOCK IN/OUT BATCH ----------
