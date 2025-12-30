@@ -1,316 +1,90 @@
 # app/main.py
 from typing import List, Any, Dict
-import os
 import shutil
 from pathlib import Path
 import uuid
+import io
+from datetime import datetime, timezone
 
-from fastapi import FastAPI, HTTPException, status, File, UploadFile
+from fastapi import FastAPI, HTTPException, status, File, UploadFile, Depends
 from fastapi.responses import PlainTextResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 import requests
-from datetime import datetime, timezone
 from PIL import Image
-import io
+from sqlalchemy import func
+from sqlalchemy.orm import Session
 
 from . import schemas
-from . import firestore_service
-from .config import FIREBASE_API_KEY
-from .gemini_client import generate_reply, is_configured as gemini_ready, MODEL_NAME
+from .config import GEMINI_API_KEY  # Removed FIREBASE imports
+from .gemini_client import generate_reply, is_configured as gemini_ready, MODEL_NAME, QuotaExceededError
 from .export_service import VoucherExportRequest, export_to_excel, export_to_pdf
+from .database import (
+    get_db, SupplierModel, ItemModel, StockTransactionModel, WarehouseModel,
+    CompanyInfoModel, StockInRecordModel, StockOutRecordModel, UserModel, get_datadir
+)
+from .auth_middleware import get_current_user, get_current_user_optional
 
-# =============================================================
-# In-memory stores (Firebase DB sẽ thay thế sau) - Tạm thời
-# =============================================================
-suppliers_store: Dict[int, schemas.Supplier] = {}
-items_store: Dict[int, schemas.Item] = {}
-stock_transactions_store: List[schemas.StockTransaction] = []
+# Type alias for authenticated user payload returned by auth_middleware
+AuthUserModel = Dict[str, Any]
 
-# Company & Warehouse stores
-company_info: schemas.CompanyInfo | None = None
-warehouses_store: Dict[int, schemas.Warehouse] = {}
-active_warehouse_id: int | None = None
+# Backwards-compatible dependency name (was require_auth with Firebase)
+require_auth = get_current_user
+from .db_helpers import (
+    supplier_model_to_schema, supplier_schema_to_dict,
+    item_model_to_schema, item_schema_to_dict,
+    warehouse_model_to_schema, warehouse_schema_to_dict,
+    stock_transaction_model_to_schema,
+    company_info_model_to_schema,
+    stock_in_record_model_to_schema,
+    stock_out_record_model_to_schema,
+)
 
-_supplier_id = 1
-_item_id = 1
-_tx_id = 1
-_warehouse_id = 1
+# Import new auth routes
+from .auth_routes import router as auth_router
+from .user_routes import router as user_router
+from .chatbot_routes import router as chatbot_router
 
-def _next_supplier_id() -> int:
-    global _supplier_id
-    i = _supplier_id
-    _supplier_id += 1
-    return i
-
-def _next_item_id() -> int:
-    global _item_id
-    i = _item_id
-    _item_id += 1
-    return i
-
-def _next_tx_id() -> int:
-    global _tx_id
-    i = _tx_id
-    _tx_id += 1
-    return i
-
-def _next_warehouse_id() -> int:
-    global _warehouse_id
-    i = _warehouse_id
-    _warehouse_id += 1
-    return i
-
-# Tạo thư mục lưu uploads
-UPLOADS_DIR = Path("uploads")
-UPLOADS_DIR.mkdir(exist_ok=True)
+DATA_DIR = get_datadir()
+UPLOADS_DIR = DATA_DIR / "uploads"
+UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 LOGO_DIR = UPLOADS_DIR / "logos"
-LOGO_DIR.mkdir(exist_ok=True)
+LOGO_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="N3T KhoHang API", version="0.1.0")
 
-# Mount static files
-app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+app.mount("/uploads", StaticFiles(directory=str(UPLOADS_DIR)), name="uploads")
 
-# CORS: dev thì cho phép tất cả, sau này có thể siết lại
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # hoặc ["http://localhost:5173"]
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# Include routers
+app.include_router(auth_router)
+app.include_router(user_router)
+app.include_router(chatbot_router)
 
 # -------------------------------------------------
 # ROOT
 # -------------------------------------------------
 @app.get("/")
 def root():
-    return {"message": "N3T KhoHang API is running"}
-
-
-@app.on_event("startup")
-def sync_from_firestore_on_startup():
-    """Khi ứng dụng khởi động, load dữ liệu từ Firestore vào bộ nhớ trong server
-    - items, suppliers, warehouses
-    Cập nhật các counter (_item_id, _supplier_id, _warehouse_id) để tránh trùng ID
-    """
-    global _item_id, _supplier_id, _warehouse_id
-    try:
-        # Items
-        fb_items = firestore_service.get_all_items()
-        if fb_items:
-            items_store.clear()
-            max_id = 0
-            for d in fb_items:
-                try:
-                    iid = int(d.get('id'))
-                except Exception:
-                    # skip non-numeric ids
-                    continue
-                item = schemas.Item(
-                    id=iid,
-                    name=d.get('name', ''),
-                    sku=d.get('sku', ''),
-                    quantity=int(d.get('quantity', 0)),
-                    unit=d.get('unit', ''),
-                    price=float(d.get('price', 0)),
-                    category=d.get('category', ''),
-                    supplier_id=d.get('supplier_id', None)
-                )
-                items_store[iid] = item
-                if iid > max_id:
-                    max_id = iid
-            _item_id = max_id + 1
-
-        # Suppliers
-        fb_suppliers = firestore_service.get_all_suppliers()
-        if fb_suppliers:
-            suppliers_store.clear()
-            max_id = 0
-            for d in fb_suppliers:
-                try:
-                    sid = int(d.get('id'))
-                except Exception:
-                    continue
-                sup = schemas.Supplier(id=sid, **{k: d.get(k) for k in ['name','tax_id','address','phone','email','bank_account','bank_name','notes']})
-                suppliers_store[sid] = sup
-                if sid > max_id:
-                    max_id = sid
-            _supplier_id = max_id + 1
-
-        # Warehouses
-        fb_whs = firestore_service.get_all_warehouses()
-        if fb_whs:
-            warehouses_store.clear()
-            max_id = 0
-            for d in fb_whs:
-                try:
-                    wid = int(d.get('id'))
-                except Exception:
-                    continue
-                wh = schemas.Warehouse(id=wid, created_at=datetime.now(timezone.utc), is_active=d.get('is_active', False), name=d.get('name',''), code=d.get('code',''), address=d.get('address',''), phone=d.get('phone',''), managers=d.get('managers',[]), notes=d.get('notes',''))
-                warehouses_store[wid] = wh
-                if wid > max_id:
-                    max_id = wid
-            _warehouse_id = max_id + 1
-
-    except Exception:
-        # If sync fails, continue with in-memory defaults
-        pass
-
+    return {"message": "N3T KhoHang API is running with JWT Auth"}
 
 # -------------------------------------------------
-# AUTH (Firebase)
+# OLD AUTH ROUTES (DEPRECATED - KEPT FOR REFERENCE)
+# Use /auth/* and /users/* routes instead
 # -------------------------------------------------
 
-@app.post("/auth/register", response_model=schemas.AuthResponse)
-def register_user(payload: schemas.AuthRegisterRequest):
-    """
-    Đăng ký tài khoản mới qua Firebase Auth
-    """
-    url = f"https://identitytoolkit.googleapis.com/v1/accounts:signUp?key={FIREBASE_API_KEY}"
-    data: Dict[str, Any] = {
-        "email": payload.email,
-        "password": payload.password,
-        "returnSecureToken": True,
-    }
-    if payload.full_name:
-        data["displayName"] = payload.full_name
-
-    r = requests.post(url, json=data)
-    if not r.ok:
-        err = r.json()
-        msg = err.get("error", {}).get("message", "FIREBASE_SIGNUP_FAILED")
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=msg,
-        )
-
-    fb = r.json()
-    user = schemas.User(
-        id=fb.get("localId", ""),
-        email=fb["email"],
-        name=fb.get("displayName"),
-    )
-    return schemas.AuthResponse(
-        user=user,
-        token=fb["idToken"],
-        refresh_token=fb.get("refreshToken"),
-    )
-
-
-@app.post("/auth/login", response_model=schemas.AuthResponse)
-def login_user(payload: schemas.AuthLoginRequest):
-    """
-    Đăng nhập bằng email/password qua Firebase Auth
-    """
-    url = (
-        "https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword"
-        f"?key={FIREBASE_API_KEY}"
-    )
-    data: Dict[str, Any] = {
-        "email": payload.email,
-        "password": payload.password,
-        "returnSecureToken": True,
-    }
-
-    r = requests.post(url, json=data)
-    if not r.ok:
-        err = r.json()
-        msg = err.get("error", {}).get("message", "FIREBASE_LOGIN_FAILED")
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=msg,
-        )
-
-    fb = r.json()
-    user = schemas.User(
-        id=fb.get("localId", ""),
-        email=fb["email"],
-        name=fb.get("displayName"),
-    )
-    return schemas.AuthResponse(
-        user=user,
-        token=fb["idToken"],
-        refresh_token=fb.get("refreshToken"),
-    )
-
-@app.post("/auth/change-password")
-def change_password(payload: schemas.AuthChangePasswordRequest):
-    """
-    Đổi mật khẩu:
-    1. Đăng nhập bằng mật khẩu cũ để lấy ID Token (xác thực người dùng).
-    2. Dùng ID Token để cập nhật mật khẩu mới.
-    """
-    # 1. Xác thực (Login) với mật khẩu cũ
-    login_url = f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={FIREBASE_API_KEY}"
-    login_data = {
-        "email": payload.email,
-        "password": payload.old_password,
-        "returnSecureToken": True,
-    }
-    
-    r_login = requests.post(login_url, json=login_data)
-    if not r_login.ok:
-        raise HTTPException(status_code=400, detail="Mật khẩu cũ không chính xác")
-    
-    id_token = r_login.json().get("idToken")
-
-    # 2. Cập nhật mật khẩu mới
-    update_url = f"https://identitytoolkit.googleapis.com/v1/accounts:update?key={FIREBASE_API_KEY}"
-    update_data = {
-        "idToken": id_token,
-        "password": payload.new_password,
-        "returnSecureToken": False,
-    }
-    
-    r_update = requests.post(update_url, json=update_data)
-    if not r_update.ok:
-        err = r_update.json()
-        msg = err.get("error", {}).get("message", "CHANGE_PASSWORD_FAILED")
-        raise HTTPException(status_code=400, detail=msg)
-
-    return {"message": "Đổi mật khẩu thành công"}
-
-
-@app.post("/auth/logout", status_code=200)
-def logout_user():
-    """
-    Firebase không có API sign-out phía server cho REST; client chỉ cần xoá token.
-    Endpoint này tồn tại để đồng bộ luồng UI, luôn trả 200.
-    """
-    return {"message": "logged out"}
-
-
-@app.post("/auth/forgot-password", status_code=200)
-def forgot_password(payload: schemas.AuthForgotPasswordRequest):
-    """
-    Gửi email đặt lại mật khẩu qua Firebase Auth
-    """
-    url = f"https://identitytoolkit.googleapis.com/v1/accounts:sendOobCode?key={FIREBASE_API_KEY}"
-    data = {
-        "requestType": "PASSWORD_RESET",
-        "email": payload.email,
-    }
-
-    r = requests.post(url, json=data)
-    if not r.ok:
-        err = r.json()
-        msg = err.get("error", {}).get("message", "FIREBASE_ERROR")
-        # Một số lỗi phổ biến: EMAIL_NOT_FOUND
-        if msg == "EMAIL_NOT_FOUND":
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Email không tồn tại trong hệ thống",
-            )
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=msg,
-        )
-    
-    return {"message": "Email đặt lại mật khẩu đã được gửi. Vui lòng kiểm tra hộp thư."}
+# @app.post("/auth/register") - DEPRECATED, use /auth/register/request-otp
+# @app.post("/auth/login") - DEPRECATED, use /auth/login  
+# @app.post("/auth/change-password") - DEPRECATED, use /auth/password/*
+# @app.post("/auth/logout") - DEPRECATED
+# @app.post("/auth/forgot-password") - DEPRECATED, use /auth/password/request-otp
 
 
 # -------------------------------------------------
@@ -318,135 +92,240 @@ def forgot_password(payload: schemas.AuthForgotPasswordRequest):
 # -------------------------------------------------
 
 @app.get("/suppliers", response_model=List[schemas.Supplier])
-def get_suppliers():
-    return list(suppliers_store.values())
+def get_suppliers(db: Session = Depends(get_db)):
+    suppliers = db.query(SupplierModel).all()
+    return [supplier_model_to_schema(s) for s in suppliers]
 
 
 @app.post("/suppliers", response_model=schemas.Supplier)
-def create_supplier(supplier: schemas.SupplierCreate):
-    new_supplier = schemas.Supplier(id=_next_supplier_id(), **supplier.model_dump())
-    suppliers_store[new_supplier.id] = new_supplier
-    # Persist to Firestore
-    try:
-        firestore_service.save_supplier(new_supplier.id, new_supplier.model_dump())
-    except Exception:
-        pass
-    return new_supplier
-
-
-@app.get("/suppliers/{supplier_id}/transactions")
-def get_supplier_transactions(supplier_id: int):
-    """
-    API: GET /suppliers/{supplier_id}/transactions
-    Purpose: Lấy lịch sử giao dịch nhập/xuất kho của một nhà cung cấp
-    Response (JSON) [200]: {
-        "stock_in": [...],  // List[StockInRecord]
-        "stock_out": [...],  // List[StockOutRecord]
-        "total_transactions": int,
-        "outstanding_debt": float
-    }
-    Response Errors:
-    - 404: { "detail": "Supplier not found" }
-    """
-    supplier = suppliers_store.get(supplier_id)
-    if not supplier:
-        raise HTTPException(status_code=404, detail="Không tìm thấy nhà cung cấp")
+def create_supplier(
+    supplier: schemas.SupplierCreate, 
+    db: Session = Depends(get_db),
+    current_user: AuthUserModel = Depends(require_auth)
+):
+    if current_user.role not in ['admin', 'manager']:
+        raise HTTPException(status_code=403, detail="Không có quyền tạo nhà cung cấp")
     
-    # Filter stock in records by supplier name
-    stock_in_records = [
-        record for record in stock_in_store.values()
-        if record.supplier == supplier.name
-    ]
+    existing = db.query(SupplierModel).filter(SupplierModel.name == supplier.name).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Nhà cung cấp đã tồn tại")
     
-    # Stock out doesn't have supplier field, so we return empty list
-    # In real scenario, you might have supplier tracking in stock out too
-    stock_out_records = []
-    
-    return {
-        "stock_in": stock_in_records,
-        "stock_out": stock_out_records,
-        "total_transactions": len(stock_in_records) + len(stock_out_records),
-        "outstanding_debt": supplier.outstanding_debt
-    }
+    db_supplier = SupplierModel(**supplier_schema_to_dict(supplier))
+    db.add(db_supplier)
+    db.commit()
+    db.refresh(db_supplier)
+    return supplier_model_to_schema(db_supplier)
 
 
 @app.put("/suppliers/{supplier_id}", response_model=schemas.Supplier)
-def update_supplier(supplier_id: int, supplier: schemas.SupplierCreate):
-    db_sup = suppliers_store.get(supplier_id)
-    if not db_sup:
+def update_supplier(
+    supplier_id: int, 
+    supplier: schemas.SupplierUpdate, 
+    db: Session = Depends(get_db),
+    current_user: AuthUserModel = Depends(require_auth)
+):
+    if current_user.role not in ['admin', 'manager']:
+        raise HTTPException(status_code=403, detail="Không có quyền cập nhật nhà cung cấp")
+    
+    db_supplier = db.query(SupplierModel).filter(SupplierModel.id == supplier_id).first()
+    if not db_supplier:
         raise HTTPException(status_code=404, detail="Không tìm thấy nhà cung cấp")
-    updated = db_sup.model_copy(update=supplier.model_dump())
-    suppliers_store[supplier_id] = updated
-    try:
-        firestore_service.save_supplier(supplier_id, updated.model_dump())
-    except Exception:
-        pass
-    return updated
+    
+    update_data = supplier.model_dump(exclude_unset=True)
+    for key, value in update_data.items():
+        setattr(db_supplier, key, value)
+    
+    db.commit()
+    db.refresh(db_supplier)
+    return supplier_model_to_schema(db_supplier)
 
 
 @app.delete("/suppliers/{supplier_id}", status_code=204)
-def delete_supplier(supplier_id: int):
-    if supplier_id not in suppliers_store:
+def delete_supplier(
+    supplier_id: int, 
+    db: Session = Depends(get_db),
+    current_user: AuthUserModel = Depends(require_auth)
+):
+    if current_user.role not in ['admin', 'manager']:
+        raise HTTPException(status_code=403, detail="Không có quyền xóa nhà cung cấp")
+    
+    db_supplier = db.query(SupplierModel).filter(SupplierModel.id == supplier_id).first()
+    if not db_supplier:
         raise HTTPException(status_code=404, detail="Không tìm thấy nhà cung cấp")
-    del suppliers_store[supplier_id]
-    try:
-        firestore_service.delete_supplier(supplier_id)
-    except Exception:
-        pass
+    
+    db.delete(db_supplier)
+    db.commit()
     return None
+
+
+@app.get("/suppliers/{supplier_id}/transactions")
+def get_supplier_transactions(supplier_id: int, db: Session = Depends(get_db)):
+    supplier = db.query(SupplierModel).filter(SupplierModel.id == supplier_id).first()
+    if not supplier:
+        raise HTTPException(status_code=404, detail="Không tìm thấy nhà cung cấp")
+    
+    db_stock_in_records = db.query(StockInRecordModel).filter(
+        StockInRecordModel.supplier == supplier.name
+    ).all()
+    stock_in_records = [stock_in_record_model_to_schema(r) for r in db_stock_in_records]
+    
+    return {
+        "stock_in": stock_in_records,
+        "stock_out": [],
+        "total_transactions": len(stock_in_records),
+        "outstanding_debt": supplier.outstanding_debt or 0.0
+    }
 
 # -------------------------------------------------
 # ITEMS
 # -------------------------------------------------
 
 @app.get("/items", response_model=List[schemas.Item])
-def get_items():
-    return list(items_store.values())
+def get_items(db: Session = Depends(get_db)):
+    items = db.query(ItemModel).all()
+    return [item_model_to_schema(i) for i in items]
 
 
 @app.post("/items", response_model=schemas.Item)
-def create_item(item: schemas.ItemCreate):
-    for existing in items_store.values():
-        if existing.sku == item.sku:
-            raise HTTPException(status_code=400, detail="SKU đã tồn tại")
-    new_item = schemas.Item(id=_next_item_id(), **item.model_dump())
-    items_store[new_item.id] = new_item
-    # Persist to Firestore (best-effort)
-    try:
-        firestore_service.save_item(new_item.model_dump())
-    except Exception:
-        # Do not block API if Firestore fails; it's best-effort
-        pass
-    return new_item
+def create_item(
+    item: schemas.ItemCreate, 
+    db: Session = Depends(get_db),
+    current_user: AuthUserModel = Depends(require_auth) 
+):
+    existing = db.query(ItemModel).filter(ItemModel.sku == item.sku).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="SKU đã tồn tại")
+    
+    db_item = ItemModel(**item_schema_to_dict(item))
+    db.add(db_item)
+    db.commit()
+    db.refresh(db_item)
+    return item_model_to_schema(db_item)
 
 
 @app.put("/items/{item_id}", response_model=schemas.Item)
-def update_item(item_id: int, item: schemas.ItemUpdate):
-    db_item = items_store.get(item_id)
+def update_item(
+    item_id: int, 
+    item: schemas.ItemUpdate, 
+    db: Session = Depends(get_db),
+    current_user: AuthUserModel = Depends(require_auth)
+):
+    db_item = db.query(ItemModel).filter(ItemModel.id == item_id).first()
     if not db_item:
         raise HTTPException(status_code=404, detail="Không tìm thấy hàng hoá")
-    data = item.model_dump(exclude_unset=True)
-    updated = db_item.model_copy(update=data)
-    items_store[item_id] = updated
-    # Update Firestore (best-effort)
-    try:
-        firestore_service.update_item(item_id, data)
-    except Exception:
-        pass
-    return updated
+    
+    update_data = item.model_dump(exclude_unset=True)
+    if 'sku' in update_data and update_data['sku'] != db_item.sku:
+        existing = db.query(ItemModel).filter(ItemModel.sku == update_data['sku']).first()
+        if existing:
+            raise HTTPException(status_code=400, detail="SKU đã tồn tại")
+    
+    for key, value in update_data.items():
+        setattr(db_item, key, value)
+    
+    db_item.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(db_item)
+    return item_model_to_schema(db_item)
 
 
 @app.delete("/items/{item_id}", status_code=204)
-def delete_item(item_id: int):
-    if item_id not in items_store:
+def delete_item(
+    item_id: int, 
+    db: Session = Depends(get_db),
+    current_user: AuthUserModel = Depends(require_auth)
+):
+    db_item = db.query(ItemModel).filter(ItemModel.id == item_id).first()
+    if not db_item:
         raise HTTPException(status_code=404, detail="Không tìm thấy hàng hoá")
-    del items_store[item_id]
-    # Remove from Firestore (best-effort)
-    try:
-        firestore_service.delete_item(item_id)
-    except Exception:
-        pass
-    return
+    
+    db.delete(db_item)
+    db.commit()
+    return None
+
+
+@app.get("/items/alerts", response_model=List[schemas.ItemAlert])
+def get_items_alerts(db: Session = Depends(get_db)):
+    """Lấy danh sách cảnh báo tồn kho"""
+    items = db.query(ItemModel).all()
+    alerts = []
+    
+    for item in items:
+        current_stock = item.quantity or 0
+        min_stock = item.min_stock or 10
+        max_stock = max(min_stock * 10, 100)
+        
+        if current_stock <= 0 or current_stock < min_stock * 0.2:
+            status = "critical"
+        elif current_stock < min_stock * 0.5:
+            status = "warning"
+        elif current_stock < min_stock:
+            status = "low"
+        elif current_stock > max_stock:
+            status = "overstock"
+        else:
+            continue
+        
+        alert = schemas.ItemAlert(
+            id=str(item.id),
+            name=item.name,
+            sku=item.sku,
+            currentStock=current_stock,
+            minStock=min_stock,
+            maxStock=max_stock,
+            category=item.category,
+            lastUpdate=item.updated_at.isoformat() if item.updated_at else item.created_at.isoformat(),
+            status=status
+        )
+        alerts.append(alert)
+    
+    return alerts
+
+
+@app.get("/items/top-items", response_model=List[schemas.TopItem])
+def get_top_items(db: Session = Depends(get_db)):
+    items = db.query(ItemModel).order_by(ItemModel.quantity.desc()).limit(10).all()
+    return [schemas.TopItem(name=item.name, value=item.quantity or 0) for item in items]
+
+
+@app.get("/items/monthly-trend", response_model=List[schemas.MonthlyTrend])
+def get_monthly_trend(db: Session = Depends(get_db)):
+    from datetime import timedelta
+    month_names = ["T1", "T2", "T3", "T4", "T5", "T6", "T7", "T8", "T9", "T10", "T11", "T12"]
+    twelve_months_ago = datetime.now(timezone.utc) - timedelta(days=365)
+    
+    transactions = db.query(StockTransactionModel).filter(
+        StockTransactionModel.timestamp >= twelve_months_ago,
+        StockTransactionModel.type == "in"
+    ).all()
+    
+    monthly_data = {month: 0 for month in month_names}
+    for tx in transactions:
+        month_key = tx.timestamp.month - 1
+        if 0 <= month_key < 12:
+            monthly_data[month_names[month_key]] += tx.quantity
+    
+    return [schemas.MonthlyTrend(month=month, value=monthly_data[month]) for month in month_names]
+
+
+@app.get("/items/category-distribution", response_model=List[schemas.CategoryDistribution])
+def get_category_distribution(db: Session = Depends(get_db)):
+    items = db.query(ItemModel).all()
+    category_data = {}
+    colors = ["#00BCD4", "#4CAF50", "#FF9800", "#F44336", "#9C27B0", "#2196F3", "#FFC107", "#795548", "#607D8B", "#E91E63"]
+    
+    for item in items:
+        category = item.category or "Khác"
+        if category not in category_data:
+            category_data[category] = 0
+        category_data[category] += item.quantity or 0
+    
+    result = []
+    for idx, (category, total_qty) in enumerate(sorted(category_data.items(), key=lambda x: x[1], reverse=True)):
+        result.append(schemas.CategoryDistribution(
+            name=category, value=total_qty, color=colors[idx % len(colors)]
+        ))
+    return result
 
 
 # -------------------------------------------------
@@ -454,38 +333,48 @@ def delete_item(item_id: int):
 # -------------------------------------------------
 
 @app.get("/stock/transactions", response_model=List[schemas.StockTransaction])
-def get_transactions():
-    # newest first
-    return sorted(stock_transactions_store, key=lambda t: t.timestamp, reverse=True)
+def get_transactions(db: Session = Depends(get_db)):
+    transactions = db.query(StockTransactionModel).order_by(StockTransactionModel.timestamp.desc()).all()
+    return [stock_transaction_model_to_schema(t) for t in transactions]
 
 
 @app.post("/stock/transactions", response_model=schemas.StockTransaction)
-def create_transaction(tx: schemas.StockTransactionCreate):
-    item = items_store.get(tx.item_id)
-    if not item:
+def create_transaction(
+    tx: schemas.StockTransactionCreate, 
+    db: Session = Depends(get_db),
+    current_user: AuthUserModel = Depends(require_auth)
+):
+    if current_user.role not in ['admin', 'manager', 'staff']:
+        raise HTTPException(status_code=403, detail="Không có quyền tạo giao dịch kho")
+    
+    db_item = db.query(ItemModel).filter(ItemModel.id == tx.item_id).first()
+    if not db_item:
         raise HTTPException(status_code=404, detail="Không tìm thấy hàng hoá")
+    
+    current_qty = db_item.quantity or 0
     if tx.type == "in":
-        new_qty = item.quantity + tx.quantity
+        new_qty = current_qty + tx.quantity
     elif tx.type == "out":
-        if item.quantity < tx.quantity:
+        if current_qty < tx.quantity:
             raise HTTPException(status_code=400, detail="Không đủ tồn kho để xuất")
-        new_qty = item.quantity - tx.quantity
+        new_qty = current_qty - tx.quantity
     else:
         raise HTTPException(status_code=400, detail="Loại giao dịch phải là 'in' hoặc 'out'")
-    # Update item quantity
-    updated_item = item.model_copy(update={"quantity": new_qty})
-    items_store[item.id] = updated_item
-    # Create transaction
-    tx_schema = schemas.StockTransaction(
-        id=_next_tx_id(),
+    
+    db_item.quantity = new_qty
+    db_item.updated_at = datetime.now(timezone.utc)
+    
+    db_tx = StockTransactionModel(
         type=tx.type,
         item_id=tx.item_id,
         quantity=tx.quantity,
         note=tx.note,
         timestamp=datetime.now(timezone.utc),
     )
-    stock_transactions_store.append(tx_schema)
-    return tx_schema
+    db.add(db_tx)
+    db.commit()
+    db.refresh(db_tx)
+    return stock_transaction_model_to_schema(db_tx)
 
 
 # -------------------------------------------------
@@ -493,39 +382,44 @@ def create_transaction(tx: schemas.StockTransactionCreate):
 # -------------------------------------------------
 
 @app.get("/dashboard/stats", response_model=schemas.DashboardStats)
-def get_dashboard_stats():
-    items = list(items_store.values())
+def get_dashboard_stats(db: Session = Depends(get_db)):
+    items = db.query(ItemModel).all()
     total_items = len(items)
-    low_stock_count = sum(1 for i in items if i.quantity < 10)
-    total_value = sum(i.quantity * i.price for i in items)
-    recent_transactions = sorted(stock_transactions_store, key=lambda t: t.timestamp, reverse=True)[:10]
+    low_stock_count = sum(1 for i in items if (i.quantity or 0) < (i.min_stock or 10))
+    total_value = sum((i.quantity or 0) * i.price for i in items)
+    
+    recent_transactions = db.query(StockTransactionModel).order_by(
+        StockTransactionModel.timestamp.desc()
+    ).limit(10).all()
+    
     return schemas.DashboardStats(
         total_items=total_items,
         low_stock_count=low_stock_count,
         total_value=total_value,
-        recent_transactions=recent_transactions,
+        recent_transactions=[stock_transaction_model_to_schema(t) for t in recent_transactions],
     )
 
 
 # -------------------------------------------------
-# AI CHAT (Gemini proxy)
+# AI CHAT
 # -------------------------------------------------
-# UI gọi POST /ai/chat với JSON: {"prompt": "...", "system_instruction": "optional"}
-# Server sẽ dùng GEMINI_API_KEY (đặt trong .env) để gọi model gemini-2.5-pro
-# Trả về: {"reply": "...", "model": "gemini-2.5-pro"}
 
 @app.post("/ai/chat", response_model=schemas.AIChatResponse)
 def ai_chat(req: schemas.AIChatRequest):
     if not gemini_ready():
-        raise HTTPException(status_code=501, detail="Gemini API chưa được cấu hình trên server")
+        raise HTTPException(status_code=501, detail="Gemini API chưa được cấu hình")
     try:
         reply = generate_reply(req.prompt, req.system_instruction)
+    except QuotaExceededError as e:
+        headers = {}
+        if e.retry_after:
+            headers["Retry-After"] = str(int(e.retry_after))
+        raise HTTPException(status_code=429, detail=str(e), headers=headers)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Gemini error: {e}")
     return schemas.AIChatResponse(reply=reply, model=MODEL_NAME)
 
 
-# Trả về dưới dạng Markdown thuần (Content-Type: text/markdown)
 @app.post(
     "/ai/chat-md",
     response_class=PlainTextResponse,
@@ -533,360 +427,208 @@ def ai_chat(req: schemas.AIChatRequest):
 )
 def ai_chat_markdown(req: schemas.AIChatRequest):
     if not gemini_ready():
-        raise HTTPException(status_code=501, detail="Gemini API chưa được cấu hình trên server")
+        raise HTTPException(status_code=501, detail="Gemini API chưa được cấu hình")
     try:
         reply = generate_reply(req.prompt, req.system_instruction)
+    except QuotaExceededError as e:
+        headers = {}
+        if e.retry_after:
+            headers["Retry-After"] = str(int(e.retry_after))
+        raise HTTPException(status_code=429, detail=str(e), headers=headers)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Gemini error: {e}")
     return PlainTextResponse(reply, media_type="text/markdown")
 
 
 # -------------------------------------------------
-# STOCK IN (Nhập kho)
+# STOCK IN
 # -------------------------------------------------
 
-# In-memory store for stock in records
-stock_in_store: Dict[str, schemas.StockInRecord] = {}
-# Counter theo tháng: key = "MMYY", value = counter
-_stock_in_monthly_counters: Dict[str, int] = {}
-
-def _next_stock_in_id(warehouse_code: str, date_str: str) -> str:
-    """
-    Generate mã phiếu nhập theo format: KX_PN_MMYY_XXXX
-    - warehouse_code: K1, K2, ...
-    - PN: Phiếu Nhập
-    - MMYY: tháng năm từ date_str
-    - XXXX: STT trong tháng (reset mỗi tháng)
-    """
-    from datetime import datetime
+def _next_stock_in_id(warehouse_code: str, date_str: str, db: Session) -> str:
     try:
         date_obj = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
     except:
         date_obj = datetime.now()
     
-    month_year_key = date_obj.strftime("%m%y")  # MMYY
+    month_year_key = date_obj.strftime("%m%y")
+    prefix = f"{warehouse_code}_PN_{month_year_key}_"
     
-    # Lấy hoặc tạo counter cho tháng này
-    if month_year_key not in _stock_in_monthly_counters:
-        _stock_in_monthly_counters[month_year_key] = 1
-    else:
-        _stock_in_monthly_counters[month_year_key] += 1
+    count = db.query(func.count(StockInRecordModel.id)).filter(
+        StockInRecordModel.id.like(f"{prefix}%")
+    ).scalar() or 0
     
-    counter = _stock_in_monthly_counters[month_year_key]
-    
-    # Format: K1_PN_1225_0001
-    id_str = f"{warehouse_code}_PN_{month_year_key}_{counter:04d}"
-    return id_str
+    return f"{prefix}{count + 1:04d}"
 
 
 @app.get("/stock/in", response_model=List[schemas.StockInRecord])
-def get_stock_in_records():
-    """Lấy danh sách phiếu nhập kho"""
-    return list(stock_in_store.values())
+def get_stock_in_records(db: Session = Depends(get_db)):
+    records = db.query(StockInRecordModel).order_by(StockInRecordModel.created_at.desc()).all()
+    return [stock_in_record_model_to_schema(r) for r in records]
 
 
 @app.get("/stock/in/{record_id}", response_model=schemas.StockInRecord)
-def get_stock_in_record(record_id: str):
-    """Lấy chi tiết phiếu nhập kho theo ID"""
-    if record_id not in stock_in_store:
+def get_stock_in_record(record_id: str, db: Session = Depends(get_db)):
+    record = db.query(StockInRecordModel).filter(StockInRecordModel.id == record_id).first()
+    if not record:
         raise HTTPException(status_code=404, detail="Không tìm thấy phiếu nhập kho")
-    return stock_in_store[record_id]
+    return stock_in_record_model_to_schema(record)
 
 
 @app.post("/stock/in", response_model=schemas.StockInRecord, status_code=201)
-def create_stock_in(data: schemas.StockInBatchCreate):
-    """Tạo phiếu nhập kho mới"""
-    record_id = _next_stock_in_id(data.warehouse_code, data.date)
+def create_stock_in(
+    data: schemas.StockInBatchCreate, 
+    db: Session = Depends(get_db),
+    current_user: AuthUserModel = Depends(require_auth)
+):
+    if current_user.role not in ['admin', 'manager', 'staff']:
+        raise HTTPException(status_code=403, detail="Không có quyền tạo phiếu nhập kho")
     
-    # Calculate totals
+    record_id = _next_stock_in_id(data.warehouse_code, data.date, db)
     total_qty = sum(item.quantity for item in data.items)
     total_amt = sum(item.quantity * item.price for item in data.items)
+    items_json = [item.model_dump() for item in data.items]
     
-    # Create record
-    record = schemas.StockInRecord(
+    db_record = StockInRecordModel(
         id=record_id,
         warehouse_code=data.warehouse_code,
         supplier=data.supplier,
         date=data.date,
-        note=data.note,
-        tax_rate=data.tax_rate,
-        items=[schemas.StockInItem(**item.model_dump()) for item in data.items],
+        note=data.note or "",
+        tax_rate=data.tax_rate or 0.0,
+        payment_method=getattr(data, 'payment_method', 'tiền_mặt') or 'tiền_mặt',
+        payment_bank_account=getattr(data, 'payment_bank_account', '') or '',
+        payment_bank_name=getattr(data, 'payment_bank_name', '') or '',
+        items=items_json,
         total_quantity=total_qty,
         total_amount=total_amt,
-        created_at=datetime.now(timezone.utc).isoformat(),
         status="completed"
     )
-    # Update item quantities and persist items to Firestore
-    for it in record.items:
-        # item_id in StockInItem is string (from frontend), try map to int
-        try:
-            iid = int(it.item_id)
-        except Exception:
-            continue
-        existing = items_store.get(iid)
-        if existing:
-            new_qty = existing.quantity + it.quantity
-            updated_item = existing.model_copy(update={"quantity": new_qty})
-            items_store[iid] = updated_item
-            try:
-                firestore_service.update_item(iid, {"quantity": new_qty})
-            except Exception:
-                try:
-                    firestore_service.save_item(updated_item.model_dump())
-                except Exception:
-                    pass
-
-    # Persist stock_in record to Firestore (best-effort)
-    try:
-        firestore_service.save_stock_in(record_id, record.model_dump())
-    except Exception:
-        pass
-
-    stock_in_store[record_id] = record
-    return record
+    
+    db.add(db_record)
+    db.commit()
+    db.refresh(db_record)
+    return stock_in_record_model_to_schema(db_record)
 
 
 @app.delete("/stock/in/{record_id}", status_code=204)
-def delete_stock_in(record_id: str):
-    """Xóa phiếu nhập kho"""
-    if record_id not in stock_in_store:
+def delete_stock_in(
+    record_id: str, 
+    db: Session = Depends(get_db),
+    current_user: AuthUserModel = Depends(require_auth)
+):
+    if current_user.role not in ['admin', 'manager']:
+        raise HTTPException(status_code=403, detail="Không có quyền xóa phiếu nhập kho")
+    record = db.query(StockInRecordModel).filter(StockInRecordModel.id == record_id).first()
+    if not record:
         raise HTTPException(status_code=404, detail="Không tìm thấy phiếu nhập kho")
-    del stock_in_store[record_id]
+    
+    db.delete(record)
+    db.commit()
     return None
 
 
 # -------------------------------------------------
-# STOCK OUT (Xuất kho)
+# STOCK OUT
 # -------------------------------------------------
 
-# In-memory store for stock out records
-stock_out_store: Dict[str, schemas.StockOutRecord] = {}
-# Counter theo tháng: key = "MMYY", value = counter
-_stock_out_monthly_counters: Dict[str, int] = {}
-
-def _next_stock_out_id(warehouse_code: str, date_str: str) -> str:
-    """
-    Generate mã phiếu xuất theo format: KX_PX_MMYY_XXXX
-    - warehouse_code: K1, K2, ...
-    - PX: Phiếu Xuất
-    - MMYY: tháng năm từ date_str
-    - XXXX: STT trong tháng (reset mỗi tháng)
-    """
-    from datetime import datetime
+def _next_stock_out_id(warehouse_code: str, date_str: str, db: Session) -> str:
     try:
         date_obj = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
     except:
         date_obj = datetime.now()
     
-    month_year_key = date_obj.strftime("%m%y")  # MMYY
+    month_year_key = date_obj.strftime("%m%y")
+    prefix = f"{warehouse_code}_PX_{month_year_key}_"
     
-    # Lấy hoặc tạo counter cho tháng này
-    if month_year_key not in _stock_out_monthly_counters:
-        _stock_out_monthly_counters[month_year_key] = 1
-    else:
-        _stock_out_monthly_counters[month_year_key] += 1
+    count = db.query(func.count(StockOutRecordModel.id)).filter(
+        StockOutRecordModel.id.like(f"{prefix}%")
+    ).scalar() or 0
     
-    counter = _stock_out_monthly_counters[month_year_key]
-    
-    # Format: K1_PX_1225_0001
-    id_str = f"{warehouse_code}_PX_{month_year_key}_{counter:04d}"
-    return id_str
+    return f"{prefix}{count + 1:04d}"
 
 
 @app.get("/stock/out", response_model=List[schemas.StockOutRecord])
-def get_stock_out_records():
-    """Lấy danh sách phiếu xuất kho"""
-    # Prefer Firestore as source of truth
-    try:
-        records = firestore_service.get_stock_out_records()
-        if records:
-            # Convert each dict to StockOutRecord
-            result = []
-            for r in records:
-                # Ensure fields exist
-                result.append(schemas.StockOutRecord(
-                    id=r.get('id'),
-                    warehouse_code=r.get('warehouse_code', ''),
-                    recipient=r.get('recipient', ''),
-                    purpose=r.get('purpose', ''),
-                    date=r.get('date', ''),
-                    note=r.get('note', ''),
-                    tax_rate=r.get('tax_rate', 0),
-                    items=[schemas.StockOutItem(**item) for item in r.get('items', [])],
-                    total_quantity=r.get('total_quantity', 0),
-                    total_amount=r.get('total_amount', None),
-                    created_at=r.get('created_at', ''),
-                    status=r.get('status', 'completed'),
-                ))
-            return result
-    except Exception:
-        pass
-
-    # Fallback to in-memory store
-    return list(stock_out_store.values())
+def get_stock_out_records(db: Session = Depends(get_db)):
+    records = db.query(StockOutRecordModel).order_by(StockOutRecordModel.created_at.desc()).all()
+    return [stock_out_record_model_to_schema(r) for r in records]
 
 
 @app.get("/stock/out/{record_id}", response_model=schemas.StockOutRecord)
-def get_stock_out_record(record_id: str):
-    """Lấy chi tiết phiếu xuất kho theo ID"""
-    # Try Firestore first
-    try:
-        doc = firestore_service.get_stock_out_record(record_id)
-        if doc:
-            return schemas.StockOutRecord(
-                id=doc.get('id'),
-                warehouse_code=doc.get('warehouse_code', ''),
-                recipient=doc.get('recipient', ''),
-                purpose=doc.get('purpose', ''),
-                date=doc.get('date', ''),
-                note=doc.get('note', ''),
-                tax_rate=doc.get('tax_rate', 0),
-                items=[schemas.StockOutItem(**item) for item in doc.get('items', [])],
-                total_quantity=doc.get('total_quantity', 0),
-                total_amount=doc.get('total_amount', None),
-                created_at=doc.get('created_at', ''),
-                status=doc.get('status', 'completed'),
-            )
-    except Exception:
-        pass
-
-    if record_id not in stock_out_store:
+def get_stock_out_record(record_id: str, db: Session = Depends(get_db)):
+    record = db.query(StockOutRecordModel).filter(StockOutRecordModel.id == record_id).first()
+    if not record:
         raise HTTPException(status_code=404, detail="Không tìm thấy phiếu xuất kho")
-    return stock_out_store[record_id]
+    return stock_out_record_model_to_schema(record)
 
 
 @app.post("/stock/out", response_model=schemas.StockOutRecord, status_code=201)
-def create_stock_out(data: schemas.StockOutBatchCreate):
-    """Tạo phiếu xuất kho mới"""
-    record_id = _next_stock_out_id(data.warehouse_code, data.date)
+def create_stock_out(
+    data: schemas.StockOutBatchCreate, 
+    db: Session = Depends(get_db),
+    current_user: AuthUserModel = Depends(require_auth)
+):
+    if current_user.role not in ['admin', 'manager', 'staff']:
+        raise HTTPException(status_code=403, detail="Không có quyền tạo phiếu xuất kho")
     
-    # Calculate totals
+    record_id = _next_stock_out_id(data.warehouse_code, data.date, db)
     total_qty = sum(item.quantity for item in data.items)
-    # total_amount only for "Bán hàng" purpose
     total_amt = None
     if data.purpose == "Bán hàng":
         total_amt = sum(item.quantity * (item.sell_price or 0) for item in data.items)
     
-    # Create record
-    record = schemas.StockOutRecord(
+    items_json = [item.model_dump() for item in data.items]
+    
+    db_record = StockOutRecordModel(
         id=record_id,
         warehouse_code=data.warehouse_code,
         recipient=data.recipient,
         purpose=data.purpose,
         date=data.date,
-        note=data.note,
-        tax_rate=data.tax_rate,
-        items=[schemas.StockOutItem(**item.model_dump()) for item in data.items],
+        note=data.note or "",
+        tax_rate=data.tax_rate or 0.0,
+        payment_method=getattr(data, 'payment_method', 'tiền_mặt') or 'tiền_mặt',
+        payment_bank_account=getattr(data, 'payment_bank_account', '') or '',
+        payment_bank_name=getattr(data, 'payment_bank_name', '') or '',
+        items=items_json,
         total_quantity=total_qty,
         total_amount=total_amt,
-        created_at=datetime.now(timezone.utc).isoformat(),
         status="completed"
     )
-    # Decrease item quantities and persist changes
-    for it in record.items:
-        try:
-            iid = int(it.item_id)
-        except Exception:
-            # cannot map item id to internal numeric id; skip
-            continue
-        existing = items_store.get(iid)
-        if not existing:
-            raise HTTPException(status_code=404, detail=f"Không tìm thấy hàng hoá id={iid}")
-        if existing.quantity < it.quantity:
-            raise HTTPException(status_code=400, detail=f"Không đủ tồn kho cho mã {existing.sku}")
-        new_qty = existing.quantity - it.quantity
-        updated_item = existing.model_copy(update={"quantity": new_qty})
-        items_store[iid] = updated_item
-        # persist item quantity to Firestore (best-effort)
-        try:
-            firestore_service.update_item(iid, {"quantity": new_qty})
-        except Exception:
-            try:
-                firestore_service.save_item(updated_item.model_dump())
-            except Exception:
-                pass
-
-    # Persist stock_out record to Firestore (best-effort)
-    try:
-        firestore_service.save_stock_out(record_id, record.model_dump())
-    except Exception:
-        pass
-
-    stock_out_store[record_id] = record
-    return record
+    
+    db.add(db_record)
+    db.commit()
+    db.refresh(db_record)
+    return stock_out_record_model_to_schema(db_record)
 
 
 @app.delete("/stock/out/{record_id}", status_code=204)
-def delete_stock_out(record_id: str):
-    """Xóa phiếu xuất kho"""
-    # Try Firestore delete first
-    try:
-        ok = firestore_service.delete_stock_out(record_id)
-        if ok:
-            # also remove in-memory if present
-            if record_id in stock_out_store:
-                del stock_out_store[record_id]
-            return None
-    except Exception:
-        pass
-
-    if record_id not in stock_out_store:
+def delete_stock_out(
+    record_id: str, 
+    db: Session = Depends(get_db),
+    current_user: AuthUserModel = Depends(require_auth)
+):
+    if current_user.role not in ['admin', 'manager']:
+        raise HTTPException(status_code=403, detail="Không có quyền xóa phiếu xuất kho")
+    record = db.query(StockOutRecordModel).filter(StockOutRecordModel.id == record_id).first()
+    if not record:
         raise HTTPException(status_code=404, detail="Không tìm thấy phiếu xuất kho")
-    del stock_out_store[record_id]
+    
+    db.delete(record)
+    db.commit()
     return None
 
 
 # -------------------------------------------------
-# EXPORT (Excel & PDF)
+# EXPORT
 # -------------------------------------------------
 
 @app.post("/export/excel")
 def export_voucher_excel(data: VoucherExportRequest):
-    """
-    Xuất phiếu nhập/xuất kho ra file Excel (.xlsx)
-    
-    Request Body (JSON):
-    {
-        "voucher_type": "PN" | "PX",
-        "voucher_no": "PN-000123",
-        "voucher_date": "2025-12-13",
-        "partner_name": "Nhà cung cấp A",
-        "invoice_no": "HD001",           // optional
-        "invoice_date": "2025-12-13",    // optional
-        "warehouse_code": "K01",
-        "warehouse_location": "Kho chính", // optional
-        "attachments": "1 phiếu",        // optional
-        "prepared_by": "Nguyễn Văn A",   // optional
-        "receiver": "Trần Văn B",        // optional
-        "storekeeper": "Lê Thị C",       // optional
-        "director": "Phạm Văn D",        // optional
-        "items": [
-            {
-                "sku": "SP-001",
-                "name": "Sản phẩm A",
-                "unit": "Cái",
-                "qty_doc": 10,
-                "qty_actual": 10,
-                "unit_price": 100000
-            }
-        ]
-    }
-    
-    Response: File stream (.xlsx)
-    Headers:
-        - Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
-        - Content-Disposition: attachment; filename="PN_K01_202512_PN-000123.xlsx"
-    """
     try:
-        # Validate items count
         if len(data.items) > 18:
-            raise HTTPException(
-                status_code=400,
-                detail="Template chỉ hỗ trợ tối đa 18 dòng hàng hóa"
-            )
+            raise HTTPException(status_code=400, detail="Template chỉ hỗ trợ tối đa 18 dòng hàng hóa")
         
         buffer, filename = export_to_excel(data)
-        
         return StreamingResponse(
             buffer,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -903,26 +645,11 @@ def export_voucher_excel(data: VoucherExportRequest):
 
 @app.post("/export/pdf")
 def export_voucher_pdf(data: VoucherExportRequest):
-    """
-    Xuất phiếu nhập/xuất kho ra file PDF
-    
-    Request Body (JSON): Giống /export/excel
-    
-    Response: File stream (.pdf)
-    Headers:
-        - Content-Type: application/pdf
-        - Content-Disposition: attachment; filename="PN_K01_202512_PN-000123.pdf"
-    """
     try:
-        # Validate items count
         if len(data.items) > 18:
-            raise HTTPException(
-                status_code=400,
-                detail="Template chỉ hỗ trợ tối đa 18 dòng hàng hóa"
-            )
+            raise HTTPException(status_code=400, detail="Template chỉ hỗ trợ tối đa 18 dòng hàng hóa")
         
         buffer, filename = export_to_pdf(data)
-        
         return StreamingResponse(
             buffer,
             media_type="application/pdf",
@@ -941,113 +668,95 @@ def export_voucher_pdf(data: VoucherExportRequest):
 
 @app.post("/company/upload-logo")
 async def upload_company_logo(file: UploadFile = File(...)):
-    """
-    Upload logo công ty
-    - Giới hạn: 10MB
-    - Ảnh phải vuông (1:1 ratio)
-    - Trả về URL để truy cập logo
-    """
     try:
-        # Kiểm tra file size (10MB = 10 * 1024 * 1024 bytes)
         MAX_SIZE = 10 * 1024 * 1024
         contents = await file.read()
         
         if len(contents) > MAX_SIZE:
-            raise HTTPException(
-                status_code=400,
-                detail="Kích thước file vượt quá 10MB"
-            )
+            raise HTTPException(status_code=400, detail="Kích thước file vượt quá 10MB")
         
-        # Kiểm tra định dạng ảnh
         try:
             image = Image.open(io.BytesIO(contents))
             width, height = image.size
-            
-            # Kiểm tra aspect ratio (1:1 - vuông)
             if width != height:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Ảnh phải vuông (1:1). Ảnh hiện tại: {width}x{height}"
-                )
-            
-            # Kiểm tra định dạng
+                raise HTTPException(status_code=400, detail=f"Ảnh phải vuông (1:1). Hiện tại: {width}x{height}")
             if image.format.lower() not in ['png', 'jpg', 'jpeg', 'webp']:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Chỉ hỗ trợ định dạng: PNG, JPG, JPEG, WEBP"
-                )
-                
+                raise HTTPException(status_code=400, detail="Chỉ hỗ trợ PNG, JPG, JPEG, WEBP")
         except Exception as e:
-            if isinstance(e, HTTPException):
-                raise e
-            raise HTTPException(
-                status_code=400,
-                detail="File không phải là ảnh hợp lệ"
-            )
+            if isinstance(e, HTTPException): raise e
+            raise HTTPException(status_code=400, detail="File không phải ảnh hợp lệ")
         
-        # Tạo tên file mới (UUID + extension)
         file_ext = file.filename.split('.')[-1].lower() if file.filename else 'png'
         new_filename = f"{uuid.uuid4()}.{file_ext}"
         file_path = LOGO_DIR / new_filename
         
-        # Lưu file
         with open(file_path, "wb") as f:
             f.write(contents)
         
-        # Trầ về URL
-        logo_url = f"/uploads/logos/{new_filename}"
-        
         return {
-            "logo_url": logo_url,
+            "logo_url": f"/uploads/logos/{new_filename}",
             "filename": new_filename,
             "size": len(contents),
             "dimensions": f"{width}x{height}"
         }
-        
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Lỗi upload logo: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Lỗi upload logo: {str(e)}")
 
 
 @app.get("/company", response_model=schemas.CompanyInfo | None)
-def get_company_info():
-    """Lấy thông tin công ty"""
-    return company_info
+def get_company_info(db: Session = Depends(get_db)):
+    company = db.query(CompanyInfoModel).first()
+    if not company:
+        return None
+    return company_info_model_to_schema(company)
 
 
 @app.post("/company", response_model=schemas.CompanyInfo)
-def create_or_update_company_info(data: schemas.CompanyInfoCreate):
-    """Tạo hoặc cập nhật thông tin công ty"""
-    global company_info
+def create_or_update_company_info(
+    data: schemas.CompanyInfoCreate, 
+    db: Session = Depends(get_db),
+    current_user: AuthUserModel = Depends(require_auth)
+):
+    if current_user.role != 'admin':
+        raise HTTPException(status_code=403, detail="Chỉ admin mới có quyền cập nhật thông tin công ty")
     
-    if company_info is None:
-        # Tạo mới
-        company_info = schemas.CompanyInfo(id=1, **data.model_dump())
+    company = db.query(CompanyInfoModel).first()
+    if company is None:
+        company = CompanyInfoModel(**data.model_dump())
+        db.add(company)
     else:
-        # Cập nhật
         for key, value in data.model_dump(exclude_unset=True).items():
-            setattr(company_info, key, value)
+            setattr(company, key, value)
+        company.updated_at = datetime.now(timezone.utc)
     
-    return company_info
+    db.commit()
+    db.refresh(company)
+    return company_info_model_to_schema(company)
 
 
 @app.put("/company", response_model=schemas.CompanyInfo)
-def update_company_info(data: schemas.CompanyInfoUpdate):
-    """Cập nhật một phần thông tin công ty"""
-    global company_info
+def update_company_info(
+    data: schemas.CompanyInfoUpdate, 
+    db: Session = Depends(get_db),
+    current_user: AuthUserModel = Depends(require_auth)
+):
+    if current_user.role != 'admin':
+        raise HTTPException(status_code=403, detail="Chỉ admin mới có quyền cập nhật thông tin công ty")
     
-    if company_info is None:
+    company = db.query(CompanyInfoModel).first()
+    if company is None:
         raise HTTPException(status_code=404, detail="Chưa có thông tin công ty")
     
     for key, value in data.model_dump(exclude_unset=True).items():
         if value is not None:
-            setattr(company_info, key, value)
+            setattr(company, key, value)
+    company.updated_at = datetime.now(timezone.utc)
     
-    return company_info
+    db.commit()
+    db.refresh(company)
+    return company_info_model_to_schema(company)
 
 
 # -------------------------------------------------
@@ -1055,130 +764,628 @@ def update_company_info(data: schemas.CompanyInfoUpdate):
 # -------------------------------------------------
 
 @app.get("/warehouses", response_model=List[schemas.Warehouse])
-def get_warehouses():
-    """Lấy danh sách tất cả kho"""
-    warehouses = list(warehouses_store.values())
-    # Đánh dấu kho active
+def get_warehouses(db: Session = Depends(get_db)):
+    warehouses = db.query(WarehouseModel).all()
+    active_warehouse = db.query(WarehouseModel).filter(WarehouseModel.is_active == True).first()
+    active_id = active_warehouse.id if active_warehouse else None
+    
+    result = []
     for wh in warehouses:
-        wh.is_active = (wh.id == active_warehouse_id)
-    return warehouses
+        schema = warehouse_model_to_schema(wh)
+        schema.is_active = (wh.id == active_id)
+        result.append(schema)
+    return result
 
 
 @app.get("/warehouses/active", response_model=schemas.Warehouse | None)
-def get_active_warehouse():
-    """Lấy kho đang active"""
-    if active_warehouse_id is None:
+def get_active_warehouse(db: Session = Depends(get_db)):
+    active_warehouse = db.query(WarehouseModel).filter(WarehouseModel.is_active == True).first()
+    if not active_warehouse:
         return None
-    return warehouses_store.get(active_warehouse_id)
+    return warehouse_model_to_schema(active_warehouse)
 
 
 @app.post("/warehouses", response_model=schemas.Warehouse)
-def create_warehouse(data: schemas.WarehouseCreate):
-    """Tạo kho mới"""
-    global active_warehouse_id
+def create_warehouse(
+    data: schemas.WarehouseCreate, 
+    db: Session = Depends(get_db),
+    current_user: AuthUserModel = Depends(require_auth)
+):
+    if current_user.role not in ['admin', 'manager']:
+        raise HTTPException(status_code=403, detail="Không có quyền tạo kho")
     
-    # Kiểm tra code trùng
-    for wh in warehouses_store.values():
-        if wh.code == data.code:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Mã kho '{data.code}' đã tồn tại"
-            )
+    existing = db.query(WarehouseModel).filter(WarehouseModel.code == data.code).first()
+    if existing:
+        raise HTTPException(status_code=400, detail=f"Mã kho '{data.code}' đã tồn tại")
     
-    new_id = _next_warehouse_id()
-    warehouse = schemas.Warehouse(
-        id=new_id,
-        created_at=datetime.now(timezone.utc),
-        is_active=False,
-        **data.model_dump()
-    )
-    warehouses_store[new_id] = warehouse
+    db_warehouse = WarehouseModel(**warehouse_schema_to_dict(data))
     
-    # Nếu chưa có kho nào active, set kho mới làm active
-    if active_warehouse_id is None:
-        active_warehouse_id = new_id
-        warehouse.is_active = True
-    # Persist to Firestore (best-effort)
-    try:
-        firestore_service.save_warehouse(new_id, warehouse.model_dump())
-    except Exception:
-        pass
-
-    return warehouse
+    active_count = db.query(WarehouseModel).filter(WarehouseModel.is_active == True).count()
+    if active_count == 0:
+        db_warehouse.is_active = True
+    
+    db.add(db_warehouse)
+    db.commit()
+    db.refresh(db_warehouse)
+    return warehouse_model_to_schema(db_warehouse)
 
 
 @app.put("/warehouses/{warehouse_id}", response_model=schemas.Warehouse)
-def update_warehouse(warehouse_id: int, data: schemas.WarehouseUpdate):
-    """Cập nhật thông tin kho"""
-    if warehouse_id not in warehouses_store:
+def update_warehouse(
+    warehouse_id: int, 
+    data: schemas.WarehouseUpdate, 
+    db: Session = Depends(get_db),
+    current_user: AuthUserModel = Depends(require_auth)
+):
+    if current_user.role not in ['admin', 'manager']:
+        raise HTTPException(status_code=403, detail="Không có quyền cập nhật kho")
+    
+    db_warehouse = db.query(WarehouseModel).filter(WarehouseModel.id == warehouse_id).first()
+    if not db_warehouse:
         raise HTTPException(status_code=404, detail="Không tìm thấy kho")
     
-    warehouse = warehouses_store[warehouse_id]
+    if data.code and data.code != db_warehouse.code:
+        existing = db.query(WarehouseModel).filter(
+            WarehouseModel.code == data.code,
+            WarehouseModel.id != warehouse_id
+        ).first()
+        if existing:
+            raise HTTPException(status_code=400, detail=f"Mã kho '{data.code}' đã tồn tại")
     
-    # Kiểm tra code trùng (nếu có thay đổi code)
-    if data.code and data.code != warehouse.code:
-        for wh_id, wh in warehouses_store.items():
-            if wh_id != warehouse_id and wh.code == data.code:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Mã kho '{data.code}' đã tồn tại"
-                )
+    update_data = data.model_dump(exclude_unset=True)
+    if 'managers' in update_data:
+        update_data['managers'] = [m if isinstance(m, dict) else m.model_dump() for m in update_data['managers']]
     
-    for key, value in data.model_dump(exclude_unset=True).items():
+    for key, value in update_data.items():
         if value is not None:
-            setattr(warehouse, key, value)
-    # Persist update to Firestore (best-effort)
-    try:
-        firestore_service.save_warehouse(warehouse_id, warehouse.model_dump())
-    except Exception:
-        pass
-
-    return warehouse
+            setattr(db_warehouse, key, value)
+    
+    db_warehouse.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(db_warehouse)
+    return warehouse_model_to_schema(db_warehouse)
 
 
 @app.delete("/warehouses/{warehouse_id}")
-def delete_warehouse(warehouse_id: int):
-    """Xóa kho"""
-    global active_warehouse_id
+def delete_warehouse(
+    warehouse_id: int, 
+    db: Session = Depends(get_db),
+    current_user: AuthUserModel = Depends(require_auth)
+):
+    if current_user.role != 'admin':
+        raise HTTPException(status_code=403, detail="Chỉ admin mới có quyền xóa kho")
     
-    if warehouse_id not in warehouses_store:
+    db_warehouse = db.query(WarehouseModel).filter(WarehouseModel.id == warehouse_id).first()
+    if not db_warehouse:
         raise HTTPException(status_code=404, detail="Không tìm thấy kho")
     
-    del warehouses_store[warehouse_id]
+    was_active = db_warehouse.is_active
+    db.delete(db_warehouse)
     
-    # Nếu xóa kho đang active, chuyển sang kho đầu tiên còn lại
-    if active_warehouse_id == warehouse_id:
-        if warehouses_store:
-            active_warehouse_id = next(iter(warehouses_store.keys()))
-        else:
-            active_warehouse_id = None
+    if was_active:
+        first_warehouse = db.query(WarehouseModel).first()
+        if first_warehouse:
+            first_warehouse.is_active = True
+            db.commit()
     
-    try:
-        firestore_service.delete_warehouse(warehouse_id)
-    except Exception:
-        pass
-
+    db.commit()
     return {"message": "Đã xóa kho"}
 
 
 @app.put("/warehouses/{warehouse_id}/set-active")
-def set_active_warehouse(warehouse_id: int):
-    """Đặt kho làm active"""
-    global active_warehouse_id
+def set_active_warehouse(
+    warehouse_id: int, 
+    db: Session = Depends(get_db),
+    current_user: AuthUserModel = Depends(require_auth)
+):
+    if current_user.role not in ['admin', 'manager']:
+        raise HTTPException(status_code=403, detail="Không có quyền đổi kho active")
     
-    if warehouse_id not in warehouses_store:
+    db_warehouse = db.query(WarehouseModel).filter(WarehouseModel.id == warehouse_id).first()
+    if not db_warehouse:
         raise HTTPException(status_code=404, detail="Không tìm thấy kho")
     
-    active_warehouse_id = warehouse_id
-    # Persist active flag for all warehouses (best-effort)
-    try:
-        for wid, wh in warehouses_store.items():
-            try:
-                firestore_service.save_warehouse(wid, wh.model_dump())
-            except Exception:
-                pass
-    except Exception:
-        pass
-
+    db.query(WarehouseModel).update({WarehouseModel.is_active: False})
+    db_warehouse.is_active = True
+    db.commit()
+    
     return {"message": "Đã đổi kho active", "warehouse_id": warehouse_id}
 
+
+@app.get("/warehouses/{warehouse_id}/inventory", response_model=schemas.WarehouseInventoryStats)
+def get_warehouse_inventory(warehouse_id: int, db: Session = Depends(get_db)):
+    warehouse = db.query(WarehouseModel).filter(WarehouseModel.id == warehouse_id).first()
+    if not warehouse:
+        raise HTTPException(status_code=404, detail="Không tìm thấy kho")
+    
+    warehouse_code = warehouse.code
+    
+    stock_in_records = db.query(StockInRecordModel).filter(
+        StockInRecordModel.warehouse_code == warehouse_code
+    ).all()
+    stock_out_records = db.query(StockOutRecordModel).filter(
+        StockOutRecordModel.warehouse_code == warehouse_code
+    ).all()
+    
+    item_stats: Dict[str, schemas.WarehouseItemStatus] = {}
+    
+    for db_record in stock_in_records:
+        record = stock_in_record_model_to_schema(db_record)
+        for item in record.items:
+            if item.item_id not in item_stats:
+                item_info = db.query(ItemModel).filter(ItemModel.id == int(item.item_id)).first()
+                item_stats[item.item_id] = schemas.WarehouseItemStatus(
+                    item_id=item.item_id,
+                    item_code=item.item_code,
+                    item_name=item.item_name,
+                    unit=item.unit,
+                    total_in=0,
+                    total_out=0,
+                    current_stock=0,
+                    damaged=0,
+                    missing=0,
+                    min_stock=item_info.min_stock if item_info else 10,
+                    status="normal"
+                )
+            item_stats[item.item_id].total_in += item.quantity
+    
+    for db_record in stock_out_records:
+        record = stock_out_record_model_to_schema(db_record)
+        for item in record.items:
+            if item.item_id not in item_stats:
+                item_stats[item.item_id] = schemas.WarehouseItemStatus(
+                    item_id=item.item_id,
+                    item_code=item.item_code,
+                    item_name=item.item_name,
+                    unit=item.unit,
+                    total_in=0,
+                    total_out=0,
+                    current_stock=0,
+                    damaged=0,
+                    missing=0,
+                    min_stock=10,
+                    status="normal"
+                )
+            item_stats[item.item_id].total_out += item.quantity
+    
+    items_list = []
+    total_quantity = 0
+    items_in_stock = 0
+    items_low_stock = 0
+    items_out_of_stock = 0
+    items_damaged = 0
+    items_missing = 0
+    total_damaged = 0
+    total_missing = 0
+    
+    for item_stat in item_stats.values():
+        item_stat.current_stock = item_stat.total_in - item_stat.total_out
+        
+        if item_stat.current_stock < item_stat.min_stock:
+            item_stat.missing = item_stat.min_stock - item_stat.current_stock
+            total_missing += item_stat.missing
+            items_missing += 1
+        
+        if item_stat.current_stock <= 0:
+            item_stat.status = "out_of_stock"
+            items_out_of_stock += 1
+        elif item_stat.current_stock < item_stat.min_stock:
+            item_stat.status = "low_stock"
+            items_low_stock += 1
+        else:
+            item_stat.status = "normal"
+            items_in_stock += 1
+        
+        total_quantity += item_stat.current_stock
+        items_list.append(item_stat)
+    
+    return schemas.WarehouseInventoryStats(
+        warehouse_id=warehouse_id,
+        warehouse_code=warehouse.code,
+        warehouse_name=warehouse.name,
+        total_items=len(items_list),
+        total_quantity=total_quantity,
+        items_in_stock=items_in_stock,
+        items_low_stock=items_low_stock,
+        items_out_of_stock=items_out_of_stock,
+        items_damaged=items_damaged,
+        items_missing=items_missing,
+        total_damaged=total_damaged,
+        total_missing=total_missing,
+        items=items_list
+    )
+
+
+# -------------------------------------------------
+# REPORTS & ANALYTICS
+# -------------------------------------------------
+
+@app.get("/reports/inventory-by-category")
+def get_inventory_by_category(db: Session = Depends(get_db)):
+    items = db.query(ItemModel).all()
+    category_stats: Dict[str, float] = {}
+    category_colors = ["#00BCD4", "#4CAF50", "#FF9800", "#9C27B0", "#F44336", "#2196F3", "#FFC107", "#795548", "#607D8B", "#E91E63"]
+    
+    for item in items:
+        category = item.category or "Khác"
+        value = (item.quantity or 0) * item.price
+        if category not in category_stats:
+            category_stats[category] = 0
+        category_stats[category] += value
+    
+    result = []
+    for idx, (category, value) in enumerate(category_stats.items()):
+        result.append({
+            "category": category,
+            "value": round(value, 2),
+            "color": category_colors[idx % len(category_colors)]
+        })
+    return sorted(result, key=lambda x: x["value"], reverse=True)
+
+
+@app.get("/reports/monthly-trend")
+def get_monthly_trend_report(db: Session = Depends(get_db)):
+    db_stock_in_records = db.query(StockInRecordModel).all()
+    db_stock_out_records = db.query(StockOutRecordModel).all()
+    
+    monthly_data: Dict[str, Dict[str, int]] = {}
+    
+    for db_record in db_stock_in_records:
+        try:
+            date_obj = datetime.fromisoformat(db_record.date.replace('Z', '+00:00'))
+            month_key = date_obj.strftime("%Y-%m")
+            if month_key not in monthly_data:
+                monthly_data[month_key] = {"import": 0, "export": 0}
+            monthly_data[month_key]["import"] += db_record.total_quantity or 0
+        except: pass
+    
+    for db_record in db_stock_out_records:
+        try:
+            date_obj = datetime.fromisoformat(db_record.date.replace('Z', '+00:00'))
+            month_key = date_obj.strftime("%Y-%m")
+            if month_key not in monthly_data:
+                monthly_data[month_key] = {"import": 0, "export": 0}
+            monthly_data[month_key]["export"] += db_record.total_quantity or 0
+        except: pass
+    
+    result = []
+    month_names = ["T1", "T2", "T3", "T4", "T5", "T6", "T7", "T8", "T9", "T10", "T11", "T12"]
+    
+    for month_key in sorted(monthly_data.keys()):
+        year, month = month_key.split("-")
+        month_num = int(month)
+        result.append({
+            "month": f"{month_names[month_num - 1]} {year}",
+            "import": monthly_data[month_key]["import"],
+            "export": monthly_data[month_key]["export"]
+        })
+    
+    return result[-12:]
+
+
+@app.get("/reports/low-stock-items")
+def get_low_stock_items(db: Session = Depends(get_db)):
+    items = db.query(ItemModel).all()
+    result = []
+    for item in items:
+        quantity = item.quantity or 0
+        min_stock = item.min_stock or 10
+        if quantity < min_stock:
+            status = "danger" if quantity == 0 else "warning"
+            result.append({
+                "name": item.name,
+                "stock": quantity,
+                "min": min_stock,
+                "status": status
+            })
+    return sorted(result, key=lambda x: (x["status"] == "danger", x["stock"]))
+
+
+# -------------------------------------------------
+# CHAT MESSAGES (Lưu tin nhắn với reactions, reply)
+# -------------------------------------------------
+
+from .database import ChatMessageModel, UserPreferencesModel
+
+@app.get("/chat/messages/{conversation_id}", response_model=List[schemas.ChatMessage])
+def get_chat_messages(
+    conversation_id: str,
+    db: Session = Depends(get_db),
+    current_user: AuthUserModel = Depends(require_auth)
+):
+    """
+    API: GET /chat/messages/{conversation_id}
+    Purpose: Lấy tất cả tin nhắn của một conversation
+    Request: None
+    Response (JSON) [200]: [
+        {
+            "id": "uuid",
+            "conversation_id": "bot",
+            "sender": "user",
+            "text": "Hello",
+            "reply_to": {"id": "msg_id", "text": "...", "sender": "bot"} | null,
+            "reactions": ["👍", "❤️"],
+            "created_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2024-01-01T00:00:00Z"
+        }
+    ]
+    """
+    messages = db.query(ChatMessageModel).filter(
+        ChatMessageModel.conversation_id == conversation_id
+    ).order_by(ChatMessageModel.created_at.asc()).all()
+    
+    return [
+        schemas.ChatMessage(
+            id=m.id,
+            conversation_id=m.conversation_id,
+            sender=m.sender,
+            text=m.text,
+            reply_to=schemas.ReplyInfo(**m.reply_to) if m.reply_to else None,
+            reactions=m.reactions or [],
+            created_at=m.created_at,
+            updated_at=m.updated_at
+        )
+        for m in messages
+    ]
+
+
+@app.post("/chat/messages", response_model=schemas.ChatMessage, status_code=201)
+def create_chat_message(
+    message: schemas.ChatMessageCreate,
+    db: Session = Depends(get_db),
+    current_user: AuthUserModel = Depends(require_auth)
+):
+    """
+    API: POST /chat/messages
+    Purpose: Tạo tin nhắn mới
+    Request (JSON): {
+        "id": "uuid",
+        "conversation_id": "bot",
+        "sender": "user",
+        "text": "Hello",
+        "reply_to": {"id": "msg_id", "text": "...", "sender": "bot"} | null,
+        "reactions": []
+    }
+    Response (JSON) [201]: ChatMessage object
+    """
+    # Kiểm tra message đã tồn tại chưa (tránh duplicate)
+    existing = db.query(ChatMessageModel).filter(ChatMessageModel.id == message.id).first()
+    if existing:
+        return schemas.ChatMessage(
+            id=existing.id,
+            conversation_id=existing.conversation_id,
+            sender=existing.sender,
+            text=existing.text,
+            reply_to=schemas.ReplyInfo(**existing.reply_to) if existing.reply_to else None,
+            reactions=existing.reactions or [],
+            created_at=existing.created_at,
+            updated_at=existing.updated_at
+        )
+    
+    db_message = ChatMessageModel(
+        id=message.id,
+        conversation_id=message.conversation_id,
+        sender=message.sender,
+        text=message.text,
+        reply_to=message.reply_to.model_dump() if message.reply_to else None,
+        reactions=message.reactions or [],
+    )
+    db.add(db_message)
+    db.commit()
+    db.refresh(db_message)
+    
+    return schemas.ChatMessage(
+        id=db_message.id,
+        conversation_id=db_message.conversation_id,
+        sender=db_message.sender,
+        text=db_message.text,
+        reply_to=schemas.ReplyInfo(**db_message.reply_to) if db_message.reply_to else None,
+        reactions=db_message.reactions or [],
+        created_at=db_message.created_at,
+        updated_at=db_message.updated_at
+    )
+
+
+@app.put("/chat/messages/{message_id}/reactions", response_model=schemas.ChatMessage)
+def update_message_reactions(
+    message_id: str,
+    update_data: schemas.ChatMessageUpdate,
+    db: Session = Depends(get_db),
+    current_user: AuthUserModel = Depends(require_auth)
+):
+    """
+    API: PUT /chat/messages/{message_id}/reactions
+    Purpose: Cập nhật reactions của tin nhắn
+    Request (JSON): { "reactions": ["👍", "❤️"] }
+    Response (JSON) [200]: ChatMessage object
+    """
+    db_message = db.query(ChatMessageModel).filter(ChatMessageModel.id == message_id).first()
+    if not db_message:
+        raise HTTPException(status_code=404, detail="Không tìm thấy tin nhắn")
+    
+    if update_data.reactions is not None:
+        db_message.reactions = update_data.reactions
+    
+    db_message.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(db_message)
+    
+    return schemas.ChatMessage(
+        id=db_message.id,
+        conversation_id=db_message.conversation_id,
+        sender=db_message.sender,
+        text=db_message.text,
+        reply_to=schemas.ReplyInfo(**db_message.reply_to) if db_message.reply_to else None,
+        reactions=db_message.reactions or [],
+        created_at=db_message.created_at,
+        updated_at=db_message.updated_at
+    )
+
+
+@app.delete("/chat/messages/{conversation_id}", status_code=204)
+def clear_chat_messages(
+    conversation_id: str,
+    db: Session = Depends(get_db),
+    current_user: AuthUserModel = Depends(require_auth)
+):
+    """
+    API: DELETE /chat/messages/{conversation_id}
+    Purpose: Xóa tất cả tin nhắn của một conversation
+    """
+    db.query(ChatMessageModel).filter(
+        ChatMessageModel.conversation_id == conversation_id
+    ).delete()
+    db.commit()
+    return None
+
+
+# -------------------------------------------------
+# USER PREFERENCES (Theme settings)
+# -------------------------------------------------
+
+@app.get("/user/preferences", response_model=schemas.UserPreferences)
+def get_user_preferences(
+    db: Session = Depends(get_db),
+    current_user: AuthUserModel = Depends(require_auth)
+):
+    """
+    API: GET /user/preferences
+    Purpose: Lấy theme preferences của user hiện tại
+    Response (JSON) [200]: {
+        "id": 1,
+        "user_id": "firebase_uid",
+        "accent_id": "blue",
+        "light_mode_theme": {
+            "gradient_id": "default",
+            "pattern_id": null,
+            "pattern_opacity": 0.1,
+            "pattern_size_px": 300,
+            "pattern_tint": null
+        },
+        "dark_mode_theme": {
+            "gradient_id": "polar-lights",
+            "pattern_id": "hearts",
+            "pattern_opacity": 0.08,
+            "pattern_size_px": 250,
+            "pattern_tint": "#ffffff"
+        },
+        "created_at": "2024-01-01T00:00:00Z",
+        "updated_at": "2024-01-01T00:00:00Z"
+    }
+    """
+    prefs = db.query(UserPreferencesModel).filter(
+        UserPreferencesModel.user_id == current_user.id
+    ).first()
+    
+    if not prefs:
+        # Tạo preferences mặc định nếu chưa có
+        prefs = UserPreferencesModel(
+            user_id=current_user.id,
+            accent_id="blue",
+            light_mode_gradient_id="default",
+            light_mode_pattern_id=None,
+            light_mode_pattern_opacity=0.1,
+            light_mode_pattern_size_px=300,
+            light_mode_pattern_tint=None,
+            dark_mode_gradient_id="default",
+            dark_mode_pattern_id=None,
+            dark_mode_pattern_opacity=0.1,
+            dark_mode_pattern_size_px=300,
+            dark_mode_pattern_tint=None,
+        )
+        db.add(prefs)
+        db.commit()
+        db.refresh(prefs)
+    
+    return schemas.UserPreferences(
+        id=prefs.id,
+        user_id=prefs.user_id,
+        accent_id=prefs.accent_id,
+        light_mode_theme=schemas.ChatThemeConfig(
+            gradient_id=prefs.light_mode_gradient_id,
+            pattern_id=prefs.light_mode_pattern_id,
+            pattern_opacity=prefs.light_mode_pattern_opacity,
+            pattern_size_px=prefs.light_mode_pattern_size_px,
+            pattern_tint=prefs.light_mode_pattern_tint,
+        ),
+        dark_mode_theme=schemas.ChatThemeConfig(
+            gradient_id=prefs.dark_mode_gradient_id,
+            pattern_id=prefs.dark_mode_pattern_id,
+            pattern_opacity=prefs.dark_mode_pattern_opacity,
+            pattern_size_px=prefs.dark_mode_pattern_size_px,
+            pattern_tint=prefs.dark_mode_pattern_tint,
+        ),
+        created_at=prefs.created_at,
+        updated_at=prefs.updated_at,
+    )
+
+
+@app.put("/user/preferences", response_model=schemas.UserPreferences)
+def update_user_preferences(
+    update_data: schemas.UserPreferencesUpdate,
+    db: Session = Depends(get_db),
+    current_user: AuthUserModel = Depends(require_auth)
+):
+    """
+    API: PUT /user/preferences
+    Purpose: Cập nhật theme preferences
+    Request (JSON): {
+        "accent_id": "blue",
+        "light_mode_theme": { ... },
+        "dark_mode_theme": { ... }
+    }
+    Notes: Chỉ cần gửi các field cần cập nhật
+    """
+    prefs = db.query(UserPreferencesModel).filter(
+        UserPreferencesModel.user_id == current_user.id
+    ).first()
+    
+    if not prefs:
+        # Tạo mới nếu chưa có
+        prefs = UserPreferencesModel(user_id=current_user.id)
+        db.add(prefs)
+    
+    if update_data.accent_id is not None:
+        prefs.accent_id = update_data.accent_id
+    
+    if update_data.light_mode_theme is not None:
+        lt = update_data.light_mode_theme
+        prefs.light_mode_gradient_id = lt.gradient_id
+        prefs.light_mode_pattern_id = lt.pattern_id
+        prefs.light_mode_pattern_opacity = lt.pattern_opacity
+        prefs.light_mode_pattern_size_px = lt.pattern_size_px
+        prefs.light_mode_pattern_tint = lt.pattern_tint
+    
+    if update_data.dark_mode_theme is not None:
+        dt = update_data.dark_mode_theme
+        prefs.dark_mode_gradient_id = dt.gradient_id
+        prefs.dark_mode_pattern_id = dt.pattern_id
+        prefs.dark_mode_pattern_opacity = dt.pattern_opacity
+        prefs.dark_mode_pattern_size_px = dt.pattern_size_px
+        prefs.dark_mode_pattern_tint = dt.pattern_tint
+    
+    prefs.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(prefs)
+    
+    return schemas.UserPreferences(
+        id=prefs.id,
+        user_id=prefs.user_id,
+        accent_id=prefs.accent_id,
+        light_mode_theme=schemas.ChatThemeConfig(
+            gradient_id=prefs.light_mode_gradient_id,
+            pattern_id=prefs.light_mode_pattern_id,
+            pattern_opacity=prefs.light_mode_pattern_opacity,
+            pattern_size_px=prefs.light_mode_pattern_size_px,
+            pattern_tint=prefs.light_mode_pattern_tint,
+        ),
+        dark_mode_theme=schemas.ChatThemeConfig(
+            gradient_id=prefs.dark_mode_gradient_id,
+            pattern_id=prefs.dark_mode_pattern_id,
+            pattern_opacity=prefs.dark_mode_pattern_opacity,
+            pattern_size_px=prefs.dark_mode_pattern_size_px,
+            pattern_tint=prefs.dark_mode_pattern_tint,
+        ),
+        created_at=prefs.created_at,
+        updated_at=prefs.updated_at,
+    )
